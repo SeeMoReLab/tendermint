@@ -24,9 +24,11 @@ import (
 )
 
 var (
-	config          = cfg.DefaultConfig()
-	logger          = log.NewTMLogger(log.NewSyncWriter(os.Stdout))
-	misbehaviorFlag = ""
+	config            = cfg.DefaultConfig()
+	logger            = log.NewTMLogger(log.NewSyncWriter(os.Stdout))
+	misbehaviorFlag   = ""
+	delayScheduleFile = ""
+	nodeIndex         = 0
 )
 
 func init() {
@@ -107,7 +109,7 @@ func main() {
 		Use:   "node",
 		Short: "Run the maverick node",
 		RunE: func(command *cobra.Command, args []string) error {
-			return startNode(config, logger, misbehaviorFlag)
+			return startNode(config, logger, misbehaviorFlag, delayScheduleFile, nodeIndex)
 		},
 	}
 
@@ -125,16 +127,41 @@ func main() {
 			"e.g. --misbehaviors double-prevote,3\n"+
 			"You can also have multiple misbehaviors: e.g. double-prevote,3,no-vote,5")
 
+	// propose-delay schedule flags
+	nodeCmd.Flags().StringVar(
+		&delayScheduleFile,
+		"delay-schedule",
+		"",
+		"Path to a JSON file defining a propose-delay schedule. "+
+			"Format: [{\"at\": \"10s\", \"nodes\": {\"0\": \"4s\", \"1\": \"2s\"}}]")
+	nodeCmd.Flags().IntVar(
+		&nodeIndex,
+		"node-index",
+		0,
+		"Index of this node (0, 1, 2, ...) used to match entries in --delay-schedule")
+
 	cmd := cli.PrepareBaseCmd(rootCmd, "TM", os.ExpandEnv(filepath.Join("$HOME", cfg.DefaultTendermintDir)))
 	if err := cmd.Execute(); err != nil {
 		panic(err)
 	}
 }
 
-func startNode(config *cfg.Config, logger log.Logger, misbehaviorFlag string) error {
+func startNode(config *cfg.Config, logger log.Logger, misbehaviorFlag, delayScheduleFile string, nodeIndex int) error {
 	misbehaviors, err := nd.ParseMisbehaviors(misbehaviorFlag)
 	if err != nil {
 		return err
+	}
+
+	if delayScheduleFile != "" {
+		mb, err := cs.ProposeDelayMisbehavior(delayScheduleFile, nodeIndex)
+		if err != nil {
+			return fmt.Errorf("failed to load delay schedule: %w", err)
+		}
+		// Key 0 is a wildcard — active at all heights not covered by a
+		// height-specific entry from --misbehaviors.
+		if _, exists := misbehaviors[0]; !exists {
+			misbehaviors[0] = mb
+		}
 	}
 
 	node, err := nd.DefaultNewNode(config, logger, misbehaviors)

@@ -180,6 +180,8 @@ func (cs *State) handleMsg(mi msgInfo) {
 		// err = cs.setProposal(msg.Proposal)
 		if b, ok := cs.misbehaviors[cs.Height]; ok {
 			err = b.ReceiveProposal(cs, msg.Proposal)
+		} else if b, ok := cs.misbehaviors[0]; ok {
+			err = b.ReceiveProposal(cs, msg.Proposal)
 		} else {
 			err = defaultReceiveProposal(cs, msg.Proposal)
 		}
@@ -272,6 +274,8 @@ func (cs *State) enterPropose(height int64, round int32) {
 
 	if b, ok := cs.misbehaviors[cs.Height]; ok {
 		b.EnterPropose(cs, height, round)
+	} else if b, ok := cs.misbehaviors[0]; ok {
+		b.EnterPropose(cs, height, round)
 	} else {
 		defaultEnterPropose(cs, height, round)
 	}
@@ -305,6 +309,8 @@ func (cs *State) enterPrevote(height int64, round int32) {
 
 	// Sign and broadcast vote as necessary
 	if b, ok := cs.misbehaviors[cs.Height]; ok {
+		b.EnterPrevote(cs, height, round)
+	} else if b, ok := cs.misbehaviors[0]; ok {
 		b.EnterPrevote(cs, height, round)
 	} else {
 		defaultEnterPrevote(cs, height, round)
@@ -346,6 +352,8 @@ func (cs *State) enterPrecommit(height int64, round int32) {
 	}()
 
 	if b, ok := cs.misbehaviors[cs.Height]; ok {
+		b.EnterPrecommit(cs, height, round)
+	} else if b, ok := cs.misbehaviors[0]; ok {
 		b.EnterPrecommit(cs, height, round)
 	} else {
 		defaultEnterPrecommit(cs, height, round)
@@ -417,12 +425,16 @@ func (cs *State) addVote(
 	case tmproto.PrevoteType:
 		if b, ok := cs.misbehaviors[cs.Height]; ok {
 			b.ReceivePrevote(cs, vote)
+		} else if b, ok := cs.misbehaviors[0]; ok {
+			b.ReceivePrevote(cs, vote)
 		} else {
 			defaultReceivePrevote(cs, vote)
 		}
 
 	case tmproto.PrecommitType:
 		if b, ok := cs.misbehaviors[cs.Height]; ok {
+			b.ReceivePrecommit(cs, vote)
+		} else if b, ok := cs.misbehaviors[0]; ok {
 			b.ReceivePrecommit(cs, vote)
 		}
 		defaultReceivePrecommit(cs, vote)
