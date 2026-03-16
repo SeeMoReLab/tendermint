@@ -105,6 +105,9 @@ type State struct {
 	// the switch is passed to the state so that maveick misbehaviors can directly control which
 	// information they send to which nodes
 	sw *p2p.Switch
+
+	// epochTracker manages the adaptive timer feedback loop.
+	epochTracker *tmcon.EpochTracker
 }
 
 // StateOption sets an optional parameter on the State.
@@ -138,6 +141,19 @@ func NewState(
 		metrics:          tmcon.NopMetrics(),
 		misbehaviors:     misbehaviors,
 	}
+	// Initialize the adaptive timer epoch tracker (no-op if AdaptiveTimerAddr is empty).
+	et, err := tmcon.NewEpochTracker(config, log.NewNopLogger())
+	if err != nil {
+		et, _ = tmcon.NewEpochTracker(&cfg.ConsensusConfig{
+			AdaptiveTimerAddr:      "",
+			AdaptiveTimerEpochSize: 1000,
+			TimeoutPropose:         config.TimeoutPropose,
+			TimeoutPrevote:         config.TimeoutPrevote,
+			TimeoutPrecommit:       config.TimeoutPrecommit,
+		}, log.NewNopLogger())
+	}
+	cs.epochTracker = et
+
 	// set function defaults (may be overwritten before calling Start)
 	cs.decideProposal = cs.defaultDecideProposal
 
@@ -179,6 +195,8 @@ func (cs *State) handleMsg(mi msgInfo) {
 		// once proposal is set, we can receive block parts
 		// err = cs.setProposal(msg.Proposal)
 		if b, ok := cs.misbehaviors[cs.Height]; ok {
+			err = b.ReceiveProposal(cs, msg.Proposal)
+		} else if b, ok := cs.misbehaviors[0]; ok {
 			err = b.ReceiveProposal(cs, msg.Proposal)
 		} else {
 			err = defaultReceiveProposal(cs, msg.Proposal)
@@ -257,6 +275,10 @@ func (cs *State) enterPropose(height int64, round int32) {
 		"msg",
 		log.NewLazySprintf("enterPropose(%v/%v). Current: %v/%v/%v", height, round, cs.Height, cs.Round, cs.Step))
 
+	if round == 0 {
+		cs.epochTracker.RecordProposeStart(height)
+	}
+
 	defer func() {
 		// Done enterPropose:
 		cs.updateRoundStep(round, cstypes.RoundStepPropose)
@@ -271,6 +293,8 @@ func (cs *State) enterPropose(height int64, round int32) {
 	}()
 
 	if b, ok := cs.misbehaviors[cs.Height]; ok {
+		b.EnterPropose(cs, height, round)
+	} else if b, ok := cs.misbehaviors[0]; ok {
 		b.EnterPropose(cs, height, round)
 	} else {
 		defaultEnterPropose(cs, height, round)
@@ -303,8 +327,14 @@ func (cs *State) enterPrevote(height int64, round int32) {
 		"msg",
 		log.NewLazySprintf("enterPrevote(%v/%v); current: %v/%v/%v", height, round, cs.Height, cs.Round, cs.Step))
 
+	if round == 0 {
+		cs.epochTracker.RecordPrevoteStart(height)
+	}
+
 	// Sign and broadcast vote as necessary
 	if b, ok := cs.misbehaviors[cs.Height]; ok {
+		b.EnterPrevote(cs, height, round)
+	} else if b, ok := cs.misbehaviors[0]; ok {
 		b.EnterPrevote(cs, height, round)
 	} else {
 		defaultEnterPrevote(cs, height, round)
@@ -339,6 +369,10 @@ func (cs *State) enterPrecommit(height int64, round int32) {
 		"msg",
 		log.NewLazySprintf("enterPrecommit(%v/%v). Current: %v/%v/%v", height, round, cs.Height, cs.Round, cs.Step))
 
+	if round == 0 {
+		cs.epochTracker.RecordPrecommitStart(height)
+	}
+
 	defer func() {
 		// Done enterPrecommit:
 		cs.updateRoundStep(round, cstypes.RoundStepPrecommit)
@@ -346,6 +380,8 @@ func (cs *State) enterPrecommit(height int64, round int32) {
 	}()
 
 	if b, ok := cs.misbehaviors[cs.Height]; ok {
+		b.EnterPrecommit(cs, height, round)
+	} else if b, ok := cs.misbehaviors[0]; ok {
 		b.EnterPrecommit(cs, height, round)
 	} else {
 		defaultEnterPrecommit(cs, height, round)
@@ -417,12 +453,16 @@ func (cs *State) addVote(
 	case tmproto.PrevoteType:
 		if b, ok := cs.misbehaviors[cs.Height]; ok {
 			b.ReceivePrevote(cs, vote)
+		} else if b, ok := cs.misbehaviors[0]; ok {
+			b.ReceivePrevote(cs, vote)
 		} else {
 			defaultReceivePrevote(cs, vote)
 		}
 
 	case tmproto.PrecommitType:
 		if b, ok := cs.misbehaviors[cs.Height]; ok {
+			b.ReceivePrecommit(cs, vote)
+		} else if b, ok := cs.misbehaviors[0]; ok {
 			b.ReceivePrecommit(cs, vote)
 		}
 		defaultReceivePrecommit(cs, vote)
@@ -486,6 +526,9 @@ type evidencePool interface {
 func (cs *State) SetLogger(l log.Logger) {
 	cs.BaseService.Logger = l
 	cs.timeoutTicker.SetLogger(l)
+	if cs.epochTracker != nil {
+		cs.epochTracker.SetLogger(l.With("module", "epoch_tracker"))
+	}
 }
 
 // SetEventBus sets event bus.
@@ -677,6 +720,10 @@ func (cs *State) loadWalFile() error {
 
 // OnStop implements service.Service.
 func (cs *State) OnStop() {
+	if cs.epochTracker != nil {
+		cs.epochTracker.Close()
+	}
+
 	if err := cs.evsw.Stop(); err != nil {
 		cs.Logger.Error("error trying to stop eventSwitch", "error", err)
 	}
@@ -1129,6 +1176,10 @@ func (cs *State) enterNewRound(height int64, round int32) {
 		"msg",
 		log.NewLazySprintf("enterNewRound(%v/%v). Current: %v/%v/%v", height, round, cs.Height, cs.Round, cs.Step))
 
+	if round == 0 {
+		cs.epochTracker.ApplyPendingTimeout(cs.config)
+	}
+
 	// Increment validators if necessary
 	validators := cs.Validators
 	if cs.Round < round {
@@ -1552,6 +1603,7 @@ func (cs *State) finalizeCommit(height int64) {
 
 	// must be called before we update state
 	cs.recordMetrics(height, block)
+	cs.epochTracker.OnBlockCommitted(height, len(block.Data.Txs), cs.CommitRound)
 
 	// NewHeightStep!
 	cs.updateToState(stateCopy)

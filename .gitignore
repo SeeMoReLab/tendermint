@@ -67,3 +67,7 @@ test/fuzz/**/*.zip
 *.dvi
 # Python virtual environments
 .venv
+
+# Local testnet data
+mytestnet/
+output/
