@@ -327,6 +327,10 @@ func (cs *State) enterPrevote(height int64, round int32) {
 		"msg",
 		log.NewLazySprintf("enterPrevote(%v/%v); current: %v/%v/%v", height, round, cs.Height, cs.Round, cs.Step))
 
+	if round == 0 {
+		cs.epochTracker.RecordPrevoteStart(height)
+	}
+
 	// Sign and broadcast vote as necessary
 	if b, ok := cs.misbehaviors[cs.Height]; ok {
 		b.EnterPrevote(cs, height, round)
@@ -364,6 +368,10 @@ func (cs *State) enterPrecommit(height int64, round int32) {
 	logger.Info("enter precommit",
 		"msg",
 		log.NewLazySprintf("enterPrecommit(%v/%v). Current: %v/%v/%v", height, round, cs.Height, cs.Round, cs.Step))
+
+	if round == 0 {
+		cs.epochTracker.RecordPrecommitStart(height)
+	}
 
 	defer func() {
 		// Done enterPrecommit:

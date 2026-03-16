@@ -147,6 +147,11 @@ message TendermintReport {
     // Leadership dynamics.
     uint32 leader_change_count = 10;
     uint32 regency_change_count = 11;
+
+    // Phase-wise latency
+    float propose_latency_ms = 12;
+    float prevote_latency_ms = 13;
+    float precommit_latency_ms = 14;
 }
 
 // One report from a local node for one episode.
