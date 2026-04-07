@@ -24,11 +24,12 @@ import (
 )
 
 var (
-	config            = cfg.DefaultConfig()
-	logger            = log.NewTMLogger(log.NewSyncWriter(os.Stdout))
-	misbehaviorFlag   = ""
-	delayScheduleFile = ""
-	nodeIndex         = 0
+	config                   = cfg.DefaultConfig()
+	logger                   = log.NewTMLogger(log.NewSyncWriter(os.Stdout))
+	misbehaviorFlag          = ""
+	failureSpecFile          = ""
+	nodeIndex                = 0
+	failureStartUnixMs int64 = 0
 )
 
 func init() {
@@ -109,7 +110,7 @@ func main() {
 		Use:   "node",
 		Short: "Run the maverick node",
 		RunE: func(command *cobra.Command, args []string) error {
-			return startNode(config, logger, misbehaviorFlag, delayScheduleFile, nodeIndex)
+			return startNode(config, logger, misbehaviorFlag, failureSpecFile, nodeIndex, failureStartUnixMs)
 		},
 	}
 
@@ -127,18 +128,27 @@ func main() {
 			"e.g. --misbehaviors double-prevote,3\n"+
 			"You can also have multiple misbehaviors: e.g. double-prevote,3,no-vote,5")
 
-	// propose-delay schedule flags
+	// propose-delay failure spec flags
 	nodeCmd.Flags().StringVar(
-		&delayScheduleFile,
+		&failureSpecFile,
+		"failure-spec",
+		"",
+		"Path to failure_spec.xml defining phase-based Tendermint proposal delay.")
+	nodeCmd.Flags().StringVar(
+		&failureSpecFile,
 		"delay-schedule",
 		"",
-		"Path to a JSON file defining a propose-delay schedule. "+
-			"Format: [{\"at\": \"10s\", \"nodes\": {\"0\": \"4s\", \"1\": \"2s\"}}]")
+		"Deprecated alias for --failure-spec (supports legacy JSON schedules).")
 	nodeCmd.Flags().IntVar(
 		&nodeIndex,
 		"node-index",
 		0,
-		"Index of this node (0, 1, 2, ...) used to match entries in --delay-schedule")
+		"Index of this node (0, 1, 2, ...) used for any node-specific schedule entries")
+	nodeCmd.Flags().Int64Var(
+		&failureStartUnixMs,
+		"failure-start-unix-ms",
+		0,
+		"Absolute Unix timestamp in milliseconds used as start time for failure-spec warm-up/phases (0 = process start)")
 
 	cmd := cli.PrepareBaseCmd(rootCmd, "TM", os.ExpandEnv(filepath.Join("$HOME", cfg.DefaultTendermintDir)))
 	if err := cmd.Execute(); err != nil {
@@ -146,16 +156,20 @@ func main() {
 	}
 }
 
-func startNode(config *cfg.Config, logger log.Logger, misbehaviorFlag, delayScheduleFile string, nodeIndex int) error {
+func startNode(config *cfg.Config, logger log.Logger, misbehaviorFlag, failureSpecFile string, nodeIndex int, failureStartUnixMs int64) error {
+	if failureStartUnixMs < 0 {
+		return fmt.Errorf("--failure-start-unix-ms must be >= 0")
+	}
+
 	misbehaviors, err := nd.ParseMisbehaviors(misbehaviorFlag)
 	if err != nil {
 		return err
 	}
 
-	if delayScheduleFile != "" {
-		mb, err := cs.ProposeDelayMisbehavior(delayScheduleFile, nodeIndex)
+	if failureSpecFile != "" {
+		mb, err := cs.ProposeDelayMisbehavior(failureSpecFile, nodeIndex, failureStartUnixMs)
 		if err != nil {
-			return fmt.Errorf("failed to load delay schedule: %w", err)
+			return fmt.Errorf("failed to load proposal delay spec: %w", err)
 		}
 		// Key 0 is a wildcard — active at all heights not covered by a
 		// height-specific entry from --misbehaviors.

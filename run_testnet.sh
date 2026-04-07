@@ -7,24 +7,35 @@ TENDERMINT="$REPO_DIR/build/tendermint"
 MAVERICK="$REPO_DIR/build/maverick"
 LOAD_BIN="$REPO_DIR/build/load"
 REPORT_BIN="$REPO_DIR/build/report"
-DELAY_SCHEDULE="$REPO_DIR/delay_schedule.json"
-LOAD_DURATION=60
-LOAD_RATE=200
-LOAD_CONNECTIONS=100
+FAILURE_SPEC="$REPO_DIR/failure_spec.xml"
+LEARNING_AGENT_DIR="$REPO_DIR/../learning_agent"
+LEARNING_AGENT_MAIN="$LEARNING_AGENT_DIR/main.py"
+SCHEDULE_TENDERMINT="$LEARNING_AGENT_DIR/config/schedule_tendermint.csv"
+LOAD_DURATION=30
+LOAD_CONNECTIONS=500
+LOAD_RATE=1000
+LOAD_SEND_PERIOD=1
 LOAD_SIZE=500
 EPOCH_SIZE=1000
 POST_PEER_CONNECT_DELAY=5
+START_ALIGN_DELAY_MS=15000
 LOG_DIR="$REPO_DIR/logs"
 SERVER_LOG_DIR="$LOG_DIR/server"
 CLIENT_LOG_FILE="$LOG_DIR/tendermint_client.log"
 CLOSE_WINDOWS=0
+MODE="normal"
 INITIAL_TERMINAL_WINDOW_IDS=()
+START_UNIX_MS=0
+AGENT_HOSTS_CONFIG="$LOG_DIR/agent_hosts.config"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
+AGENT_PIDS=()
 
 # ── Parse arguments ───────────────────────────────────────────────────────────
 usage() {
-  echo "Usage: $0 [--close-windows|-w] <n> <f>"
+  echo "Usage: $0 [--close-windows|-w] <n> <f> [normal|scheduled]"
   echo "  n  total number of nodes"
   echo "  f  number of maverick nodes (indexes 0..f-1); remaining n-f are normal"
+  echo "  mode  normal (default) or scheduled"
   echo "  --close-windows, -w  close Terminal windows opened by this script on exit"
   exit 1
 }
@@ -50,13 +61,43 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
-[ "${#POSITIONAL_ARGS[@]}" -eq 2 ] || usage
+[ "${#POSITIONAL_ARGS[@]}" -ge 2 ] && [ "${#POSITIONAL_ARGS[@]}" -le 3 ] || usage
 N="${POSITIONAL_ARGS[0]}"
 F="${POSITIONAL_ARGS[1]}"
 [[ "$N" =~ ^[0-9]+$ ]] && [[ "$F" =~ ^[0-9]+$ ]] || { echo "Error: n and f must be non-negative integers"; usage; }
 [ "$F" -le "$N" ] || { echo "Error: f ($F) cannot exceed n ($N)"; exit 1; }
+if [ "${#POSITIONAL_ARGS[@]}" -eq 3 ]; then
+  MODE="${POSITIONAL_ARGS[2]}"
+fi
+case "$MODE" in
+  normal|scheduled) ;;
+  *)
+    echo "Error: unsupported mode '$MODE'. Supported: normal, scheduled"
+    usage
+    ;;
+esac
 
-echo "==> n=$N total nodes, f=$F maverick (nodes 0..$(( F - 1 ))), $(( N - F )) normal (nodes $F..$(( N - 1 )))"
+echo "==> mode=$MODE, n=$N total nodes, f=$F maverick (nodes 0..$(( F - 1 ))), $(( N - F )) normal (nodes $F..$(( N - 1 )))"
+
+if [ "$F" -gt 0 ] && [ ! -f "$FAILURE_SPEC" ]; then
+  echo "Error: failure spec not found: $FAILURE_SPEC"
+  echo "Expected Tendermint proposal delay spec at tendermint/failure_spec.xml"
+  exit 1
+fi
+if [ "$MODE" = "scheduled" ]; then
+  if [ ! -f "$LEARNING_AGENT_MAIN" ]; then
+    echo "Error: learning agent not found: $LEARNING_AGENT_MAIN"
+    exit 1
+  fi
+  if [ ! -f "$SCHEDULE_TENDERMINT" ]; then
+    echo "Error: schedule file not found: $SCHEDULE_TENDERMINT"
+    exit 1
+  fi
+fi
+
+NOW_UNIX_MS=$(python3 -c 'import time; print(int(time.time() * 1000))')
+START_UNIX_MS=$(( NOW_UNIX_MS + START_ALIGN_DELAY_MS ))
+echo "==> Synced start time (ms): $START_UNIX_MS (delay ${START_ALIGN_DELAY_MS}ms from now)"
 
 mkdir -p "$LOG_DIR" "$SERVER_LOG_DIR"
 rm -f "$SERVER_LOG_DIR"/*.log
@@ -79,6 +120,51 @@ run_and_log() {
   shift
   "$@" 2>&1 | tee -a "$log_file"
   return "${PIPESTATUS[0]}"
+}
+
+write_agent_hosts_config() {
+  : > "$AGENT_HOSTS_CONFIG"
+  for (( i=0; i<N; i++ )); do
+    echo "$i 127.0.0.1 0 0 $(agent_port "$i") $(rpc_port "$i")" >> "$AGENT_HOSTS_CONFIG"
+  done
+}
+
+start_learning_agents_if_enabled() {
+  if [ "$MODE" != "scheduled" ]; then
+    return
+  fi
+
+  if ! "$PYTHON_BIN" -c "import grpc, torch, sklearn, cryptography" >/dev/null 2>&1; then
+    echo "Error: scheduled mode requires grpc/torch/sklearn/cryptography in $PYTHON_BIN"
+    echo "Install learning_agent/requirements.txt and/or set PYTHON_BIN."
+    exit 1
+  fi
+
+  write_agent_hosts_config
+  AGENT_PIDS=()
+  echo "==> Starting learning-agent replicas (scheduled mode)..."
+  for (( i=0; i<N; i++ )); do
+    local agent_log_file="$SERVER_LOG_DIR/agent_${i}.log"
+    : > "$agent_log_file"
+    "$PYTHON_BIN" "$LEARNING_AGENT_MAIN" \
+      --node-id "$i" \
+      --protocol tendermint \
+      --hosts-config "$AGENT_HOSTS_CONFIG" \
+      --model-type scheduled \
+      --schedule-file "$SCHEDULE_TENDERMINT" \
+      --injection-start-unix-ms "$START_UNIX_MS" \
+      >"$agent_log_file" 2>&1 &
+    AGENT_PIDS+=("$!")
+  done
+
+  sleep 1
+  for (( i=0; i<N; i++ )); do
+    if ! kill -0 "${AGENT_PIDS[$i]}" 2>/dev/null; then
+      echo "Learning-agent process exited early for node$i. Last log lines:"
+      tail -n 60 "$SERVER_LOG_DIR/agent_${i}.log" || true
+      exit 1
+    fi
+  done
 }
 
 terminal_window_ids() {
@@ -129,10 +215,14 @@ close_new_windows() {
 
 cleanup() {
   echo ""
-  echo "==> Stopping all nodes and kvstore processes..."
+  echo "==> Stopping all nodes, kvstore, and learning-agent processes..."
   pkill -f "maverick node" 2>/dev/null || true
   pkill -f "tendermint node" 2>/dev/null || true
   pkill -f "abci-cli kvstore" 2>/dev/null || true
+  for pid in "${AGENT_PIDS[@]}"; do
+    kill "$pid" 2>/dev/null || true
+  done
+  pkill -f "learning_agent/main.py.*--protocol tendermint" 2>/dev/null || true
   if [ "$CLOSE_WINDOWS" -eq 1 ]; then
     echo "==> Closing spawned Terminal windows..."
     close_new_windows
@@ -185,7 +275,10 @@ done
 echo "    persistent_peers remapped to 127.0.0.1:PORT for all $N nodes"
 echo "    adaptive timer ports: 50000..$(( 50000 + N - 1 ))"
 
-# ── Step 4: Start kvstore + tendermint/maverick in separate Terminal windows ──
+# ── Step 4: Start learning agents (scheduled mode) ───────────────────────────
+start_learning_agents_if_enabled
+
+# ── Step 5: Start kvstore + tendermint/maverick in separate Terminal windows ──
 echo "==> Starting kvstore and nodes in new Terminal windows..."
 if [ "$CLOSE_WINDOWS" -eq 1 ]; then
   capture_initial_windows
@@ -208,7 +301,7 @@ for (( i=0; i<N; i++ )); do
     NODE_LOG_FILE="$SERVER_LOG_DIR/maverick_${i}.log"
     osascript \
       -e "tell application \"Terminal\"" \
-      -e "  do script \"echo '=== maverick node$i ===' | tee -a \\\"$NODE_LOG_FILE\\\" && $MAVERICK node --home $NODE_HOME --node-index $i --delay-schedule $DELAY_SCHEDULE --proxy_app tcp://127.0.0.1:$ABCI_PORT --p2p.laddr tcp://0.0.0.0:$P2P_PORT --rpc.laddr tcp://0.0.0.0:$RPC_PORT 2>&1 | tee -a \\\"$NODE_LOG_FILE\\\"\"" \
+      -e "  do script \"echo '=== maverick node$i ===' | tee -a \\\"$NODE_LOG_FILE\\\" && $MAVERICK node --home $NODE_HOME --node-index $i --failure-spec $FAILURE_SPEC --failure-start-unix-ms $START_UNIX_MS --proxy_app tcp://127.0.0.1:$ABCI_PORT --p2p.laddr tcp://0.0.0.0:$P2P_PORT --rpc.laddr tcp://0.0.0.0:$RPC_PORT 2>&1 | tee -a \\\"$NODE_LOG_FILE\\\"\"" \
       -e "end tell"
   else
     # Normal tendermint node
@@ -220,7 +313,7 @@ for (( i=0; i<N; i++ )); do
   fi
 done
 
-# ── Step 5: Wait for all nodes to be ready ───────────────────────────────────
+# ── Step 6: Wait for all nodes to be ready ───────────────────────────────────
 echo "==> Waiting for nodes to be ready..."
 for (( i=0; i<N; i++ )); do
   RPC_PORT=$(rpc_port $i)
@@ -239,7 +332,7 @@ for (( i=0; i<N; i++ )); do
   done
 done
 
-# ── Step 6: Wait for peers to connect ────────────────────────────────────────
+# ── Step 7: Wait for peers to connect ────────────────────────────────────────
 EXPECTED_PEERS=$(( N - 1 ))
 echo "==> Waiting for peers to connect (expecting $EXPECTED_PEERS peers on node0)..."
 RPC0=$(rpc_port 0)
@@ -253,36 +346,55 @@ for attempt in $(seq 1 20); do
   sleep 2
 done
 
-# ── Step 7: Run load test ─────────────────────────────────────────────────────
+# ── Step 8: Run load test ─────────────────────────────────────────────────────
 if [ "$POST_PEER_CONNECT_DELAY" -gt 0 ]; then
   echo "==> Waiting ${POST_PEER_CONNECT_DELAY}s for cluster stabilization before load..."
   sleep "$POST_PEER_CONNECT_DELAY"
 fi
 
 echo ""
-echo "==> Running load test: rate=$LOAD_RATE tx/s, duration=${LOAD_DURATION}s, connections=$LOAD_CONNECTIONS, size=${LOAD_SIZE}B"
+echo "==> Mode: $MODE"
+echo "==> Running load: duration=${LOAD_DURATION}s, connections=$LOAD_CONNECTIONS, rate=$LOAD_RATE, send-period=${LOAD_SEND_PERIOD}s, size=${LOAD_SIZE}B"
+echo "==> Load start-unix-ms: $START_UNIX_MS"
 run_and_log "$CLIENT_LOG_FILE" \
   "$LOAD_BIN" \
   --endpoints "ws://localhost:$RPC0/websocket" \
-  --broadcast-tx-method async \
+  --start-unix-ms "$START_UNIX_MS" \
   --connections "$LOAD_CONNECTIONS" \
   --rate "$LOAD_RATE" \
+  --send-period "$LOAD_SEND_PERIOD" \
   --time "$LOAD_DURATION" \
   --size "$LOAD_SIZE"
 
-# ── Step 8: Stop nodes before reading blockstore ─────────────────────────────
+# ── Step 9: Stop nodes before reading blockstore ─────────────────────────────
 echo ""
 echo "==> Stopping nodes to release blockstore lock..."
 pkill -f "maverick node" 2>/dev/null || true
 pkill -f "tendermint node" 2>/dev/null || true
+for pid in "${AGENT_PIDS[@]}"; do
+  kill "$pid" 2>/dev/null || true
+done
 sleep 2
 
-# ── Step 9: Generate report ───────────────────────────────────────────────────
+# ── Step 10: Generate report ──────────────────────────────────────────────────
+REPORT_STATE_LOG="$SERVER_LOG_DIR/tendermint_0.log"
+if [ "$F" -gt 0 ]; then
+  REPORT_STATE_LOG="$SERVER_LOG_DIR/maverick_0.log"
+fi
+REPORT_STATE_ARGS=()
+if [ -f "$REPORT_STATE_LOG" ]; then
+  REPORT_STATE_ARGS+=(--state-log "$REPORT_STATE_LOG")
+  echo "==> Using state log for wall-clock latency: $REPORT_STATE_LOG"
+else
+  echo "==> State log not found for node0; falling back to chain block timestamp latency."
+fi
+
 echo "==> Generating latency report..."
 run_and_log "$CLIENT_LOG_FILE" \
   "$REPORT_BIN" \
   --data-dir "$TESTNET_DIR/node0/data" \
   --database-type goleveldb \
+  "${REPORT_STATE_ARGS[@]}" \
   --csv "$REPO_DIR/results.csv"
 
 echo ""
@@ -290,9 +402,10 @@ echo "==> Latency report:"
 run_and_log "$CLIENT_LOG_FILE" \
   "$REPORT_BIN" \
   --data-dir "$TESTNET_DIR/node0/data" \
-  --database-type goleveldb
+  --database-type goleveldb \
+  "${REPORT_STATE_ARGS[@]}"
 
-# ── Step 10: Throughput from CSV ──────────────────────────────────────────────
+# ── Step 11: Throughput from CSV ──────────────────────────────────────────────
 echo ""
 echo "==> Throughput:"
 awk -F',' '

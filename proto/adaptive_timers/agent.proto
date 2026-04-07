@@ -167,10 +167,9 @@ message ReportLocal {
         PbftReport pbft_state = 10;
         TwoPcOverPbftReport two_pc_over_pbft_state = 11;
         SbftReport sbft_state = 12;
-        TendermintReport tendermint_report = 13;
-
+        TendermintReport tendermint_state = 13;
     }
-    Reward reward = 4;
+    optional Reward reward = 4;
     bytes signature = 5;
 }
 
@@ -266,7 +265,7 @@ message TimeoutStatus {
     }
     uint32 episode = 1;
     Status status = 2;
-    Timeout timeout = 3;
+    optional Timeout timeout = 3;
     // Echoes the report window selected for this episode.
     uint32 start_tick = 4;
     uint32 report_seq = 5;
